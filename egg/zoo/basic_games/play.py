@@ -222,6 +222,7 @@ def main(params):
         # the number of features for the Receiver (input) and the Sender (output) is given by n_attributes*n_values because
         # they are fed/produce 1-hot representations of the input vectors
         n_features = opts.n_attributes * opts.n_values
+
         # we define here the core of the receiver for the discriminative game, see the architectures.py file for details
         # this will be embedded in a wrapper below to define the full architecture
         receiver = RecoReceiver(n_features=n_features, n_hidden=opts.receiver_hidden)
@@ -229,11 +230,17 @@ def main(params):
     # we are now outside the block that defined game-type-specific aspects of the games: note that the core Sender architecture
     # (see architectures.py for details) is shared by the two games (it maps an input vector to a hidden layer that will be use to initialize
     # the message-producing RNN): this will also be embedded in a wrapper below to define the full architecture
-    sender = Sender(n_hidden=opts.sender_hidden, n_features=n_features)
+    if opts.max_len == 0:
+        sender = Sender(n_hidden=opts.vocab_size, n_features=n_features, log_sftmx=True)
+    else:
+        sender = Sender(n_hidden=opts.sender_hidden, n_features=n_features)
 
     # now, we instantiate the full sender and receiver architectures, and connect them and the loss into a game object
     # the implementation differs slightly depending on whether communication is optimized via Gumbel-Softmax ('gs') or Reinforce ('rf', default)
     if opts.mode.lower() == "gs":
+        if opts.max_len == 0:
+            print('Not implemented')
+            exit(0)
         # in the following lines, we embed the Sender and Receiver architectures into standard EGG wrappers that are appropriate for Gumbel-Softmax optimization
         # the Sender wrapper takes the hidden layer produced by the core agent architecture we defined above when processing input, and uses it to initialize
         # the RNN that generates the message
@@ -262,31 +269,38 @@ def main(params):
         # after each epoch
         callbacks = [core.TemperatureUpdater(agent=sender, decay=0.9, minimum=0.1)]
     else:  # NB: any other string than gs will lead to rf training!
-        # here, the interesting thing to note is that we use the same core architectures we defined above, but now we embed them in wrappers that are suited to
-        # Reinforce-based optmization
-        sender = core.RnnSenderReinforce(
-            sender,
-            vocab_size=opts.vocab_size,
-            embed_dim=opts.sender_embedding,
-            hidden_size=opts.sender_hidden,
-            cell=opts.sender_cell,
-            max_len=opts.max_len,
-        )
-        receiver = core.RnnReceiverDeterministic(
-            receiver,
-            vocab_size=opts.vocab_size,
-            embed_dim=opts.receiver_embedding,
-            hidden_size=opts.receiver_hidden,
-            cell=opts.receiver_cell,
-        )
-        game = core.SenderReceiverRnnReinforce(
-            sender,
-            receiver,
-            loss,
-            sender_entropy_coeff=opts.sender_entropy_coeff,
-            receiver_entropy_coeff=0,
-        )
-        callbacks = []
+        if opts.max_len == 0:
+            sender = core.ReinforceWrapper(sender)
+            receiver = core.ReinforceDeterministicWrapper(receiver)
+            receiver = core.SymbolReceiverWrapper(receiver, vocab_size=opts.vocab_size, agent_input_size=opts.receiver_hidden)
+            game = core.SymbolGameReinforce(sender, receiver, loss, sender_entropy_coeff=opts.sender_entropy_coeff, receiver_entropy_coeff=0.0)
+            callbacks = []
+        else:
+            # here, the interesting thing to note is that we use the same core architectures we defined above, but now we embed them in wrappers that are suited to
+            # Reinforce-based optmization
+            sender = core.RnnSenderReinforce(
+                sender,
+                vocab_size=opts.vocab_size,
+                embed_dim=opts.sender_embedding,
+                hidden_size=opts.sender_hidden,
+                cell=opts.sender_cell,
+                max_len=opts.max_len,
+            )
+            receiver = core.RnnReceiverDeterministic(
+                receiver,
+                vocab_size=opts.vocab_size,
+                embed_dim=opts.receiver_embedding,
+                hidden_size=opts.receiver_hidden,
+                cell=opts.receiver_cell,
+            )
+            game = core.SenderReceiverRnnReinforce(
+                sender,
+                receiver,
+                loss,
+                sender_entropy_coeff=opts.sender_entropy_coeff,
+                receiver_entropy_coeff=0,
+            )
+            callbacks = []
 
     # we are almost ready to train: we define here an optimizer calling standard pytorch functionality
     optimizer = core.build_optimizer(game.parameters())

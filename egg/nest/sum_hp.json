@@ -1,0 +1,19 @@
+{
+    "n_range" : [10],
+    "train_data" : ["egg/zoo/sum_game/data_generation_scripts/sum_dataset_standard_n10_train.txt"],
+    "validation_data" : ["egg/zoo/sum_game/data_generation_scripts/sum_dataset_standard_n10_test.txt"],
+    "mode" : ["gs","rf"],
+    "n_epochs" : [250],
+    "validation_batch_size" : [1000],
+    "max_len" : [1],
+    "vocab_size" : [20, 40, 80],
+    "sender_hidden" : [128, 256, 512],
+    "receiver_hidden" : [128, 256, 512],
+    "sender_embedding" : [5,30,60],
+    "receiver_embedding" : [5,30,60],
+    "receiver_cell" : "gru",
+    "sender_cell" : "gru",
+    "batch_size":[256, 512, 1024],
+    "lr":[0.1, 0.01, 0.001]
+  }
+  

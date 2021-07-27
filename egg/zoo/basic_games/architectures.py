@@ -46,10 +46,16 @@ class DiscriReceiver(nn.Module):
 # The Sender class implements the core Sender agent common to both games: it gets the input target vector and produces a hidden layer
 # that will initialize the message producing RNN
 class Sender(nn.Module):
-    def __init__(self, n_hidden, n_features):
+    def __init__(self, n_hidden, n_features, log_sftmx=False):
         super(Sender, self).__init__()
         self.fc1 = nn.Linear(n_features, n_hidden)
+        self.log_sftmx = log_sftmx
+        if log_sftmx:
+            self.logsoft = nn.LogSoftmax(dim=1)
 
     def forward(self, x, _aux_input):
-        return self.fc1(x)
+        out = self.fc1(x)
+        if self.log_sftmx:
+            out = self.logsoft(out)
+        return out
         # here, it might make sense to add a non-linearity, such as tanh

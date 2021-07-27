@@ -43,14 +43,17 @@ class ReinforceWrapper(nn.Module):
 
     def forward(self, *args, **kwargs):
         logits = self.agent(*args, **kwargs)
-
+        # print('logits', logits)
         distr = Categorical(logits=logits)
+        # print('distr', distr)
         entropy = distr.entropy()
+        # print('entropy', entropy)
 
         if self.training:
             sample = distr.sample()
         else:
             sample = logits.argmax(dim=1)
+        
         log_prob = distr.log_prob(sample)
 
         return sample, log_prob, entropy
@@ -172,14 +175,18 @@ class SymbolGameReinforce(nn.Module):
         )
 
     def forward(self, sender_input, labels, receiver_input=None, aux_input=None):
+        # print('label', labels)
         message, sender_log_prob, sender_entropy = self.sender(sender_input, aux_input)
+        # print('msg', message)
         receiver_output, receiver_log_prob, receiver_entropy = self.receiver(
             message, receiver_input, aux_input
         )
+        # print('out', receiver_output.argmax(dim=1))
 
         loss, aux_info = self.loss(
             sender_input, message, receiver_input, receiver_output, labels, aux_input
         )
+        # print('loss', loss)
 
         if self.training:
             _verify_batch_sizes(loss, sender_log_prob, receiver_log_prob)
@@ -187,7 +194,10 @@ class SymbolGameReinforce(nn.Module):
         policy_loss = (
             (loss.detach() - self.baseline.predict(loss.detach()))
             * (sender_log_prob + receiver_log_prob)
-        ).mean()
+        )
+        aux_info["policy_loss"] = policy_loss.detach()
+        policy_loss = policy_loss.mean()
+
         entropy_loss = -(
             sender_entropy.mean() * self.sender_entropy_coeff
             + receiver_entropy.mean() * self.receiver_entropy_coeff
@@ -196,11 +206,12 @@ class SymbolGameReinforce(nn.Module):
         if self.training:
             self.baseline.update(loss.detach())
 
-        full_loss = policy_loss + entropy_loss + loss.mean()
+        full_loss = policy_loss + entropy_loss + loss.mean()    
 
         aux_info["baseline"] = self.baseline.predict(loss.detach())
         aux_info["sender_entropy"] = sender_entropy.detach()
         aux_info["receiver_entropy"] = receiver_entropy.detach()
+        aux_info["output_loss"] = loss.detach()
 
         logging_strategy = (
             self.train_logging_strategy if self.training else self.test_logging_strategy

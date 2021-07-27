@@ -338,7 +338,7 @@ class PrintValidationEvents(Callback):
         print("MESSAGES")
         print([m.tolist() for m in logs.message], sep="\n")
         print("OUTPUTS")
-        print([m.tolist() for m in logs.receiver_output], sep="\n")
+        print([torch.argmax(m, dim=-1).tolist() for m in logs.receiver_output], sep="\n") # modified for the sum game
 
     # here is where we make sure we are printing the validation set (on_validation_end, not on_epoch_end)
     def on_validation_end(self, _loss, logs: Interaction, epoch: int):
