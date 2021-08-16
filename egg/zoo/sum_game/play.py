@@ -118,6 +118,12 @@ def get_params(params):
         help="If this flag is passed, at the end of training the script prints the input validation data, the corresponding messages produced by the Sender, and the output probabilities produced by the Receiver (default: do not print)",
     )
     parser.add_argument(
+        "--analyse",
+        default=False,
+        action="store_true",
+        help="If this flag is passed, analyse output at the end",
+    )
+    parser.add_argument(
         "--balanced_ce",
         type=float,
         default=-1,
@@ -137,63 +143,25 @@ def main(params):
     if opts.balanced_ce > 0:
         sample_all = [[i+j for j in range(opts.n_range)] for i in range(opts.n_range)]
         sample_all = [item for sublist in sample_all for item in sublist]
-        h, b = np.histogram(sample_all, list(range(opts.n_range)))
-        balance_weights = torch.from_numpy(1/h**opts.balanced_ce).long()
-        ptint('Balance weights: ', balance_weights)
-    else:
-        balance_weights = None
+        h, b = np.histogram(sample_all, list(range(opts.n_range*2)))
+        balance_weights = torch.from_numpy(1/h**opts.balanced_ce).float()
+        print('Balance weights: ', balance_weights)
+
     def loss(
         sender_input, _message, _receiver_input, receiver_output, labels, _aux_input
     ):
-        ## Debug: directly compute the sum of the input
-        # n = sender_input.size(-1)/2
-        # ar = torch.arange(n).to(sender_input.device)
-        # ar = torch.cat([ar, ar])
-        # ar = torch.stack([ar]*sender_input.size(0), dim=0)
-        # decoded = (sender_input*ar).sum(-1).long()
-        # print('dec', decoded)
-        # print('label', labels)
-
         if opts.loss == 'xent':  
             # in the sum game case, accuracy is computed by comparing the index with highest score in Receiver output (a distribution of unnormalized
             # probabilities over target poisitions) and the corresponding label read from input, indicating the ground-truth position of the target
             acc = (receiver_output.argmax(dim=1) == labels).detach().float()
             # We also compute the absolute difference between predition and target, as an additional metric
             dist = (receiver_output.argmax(dim=1) - labels).detach().float().abs()
-            # print('pred', receiver_output.argmax(dim=1))
-            # print('labels', labels)
             # similarly, the loss computes cross-entropy between the Receiver-produced target-position probability distribution and the labels
-            loss = F.cross_entropy(receiver_output, labels, weight=balance_weights, reduction="none")
-        # elif opts.loss == 'bce':
-        #     def vec_bin_array(arr, m):
-        #         """
-        #         Arguments: 
-        #         arr: Numpy array of positive integers
-        #         m: Number of bits of each integer to retain
+            if opts.balanced_ce > 0:
+                loss = F.cross_entropy(receiver_output, labels, weight=balance_weights.to(labels.device), reduction="none")
+            else:
+                loss = F.cross_entropy(receiver_output, labels, reduction="none")
 
-        #         Returns a copy of arr with every element replaced with a bit vector.
-        #         Bits encoded as int8's.
-        #         """
-        #         to_str_func = np.vectorize(lambda x: np.binary_repr(x).zfill(m))
-        #         strs = to_str_func(arr)
-        #         ret = np.zeros(list(arr.shape) + [m], dtype=np.int8)
-        #         for bit_ix in range(0, m):
-        #             fetch_bit_func = np.vectorize(lambda x: x[bit_ix] == '1')
-        #             ret[...,bit_ix] = fetch_bit_func(strs).astype("int8")
-        #         return ret 
-        #     def bin_2_int(bin_arr, batch_size):
-        #         ar = np.stack([2**np.arange(4)[ : :-1]]*batch_size, axis=0)
-        #         int_val = (ar*bin_array).sum(axis=-1)
-        #         return torch.from_numpy(int_val)
-        #     m = int(np.log2(2*opts.n_range)+1)
-        #     bin_label = vec_bin_array(labels.numpy())
-
-        # elif opts.loss == 'mse':
-        #     q_receiver_output = receiver_output.squeeze().round().float()
-        #     acc = (q_receiver_output == labels).detach().float()
-        #     dist = (q_receiver_output - labels).detach().float().abs()
-        #     loss = F.mse_loss(receiver_output.squeeze(), labels.float(), reduction='mean')
-        # TODO passer la target en binaire et superviser ave BCE
         return loss, {"acc": acc, "dist": dist}
 
     # again, see data_readers.py in this directory for the AttValRecoDataset data reading class
@@ -209,7 +177,7 @@ def main(params):
     )
     test_loader = DataLoader(
         SumDataset(
-            path=opts.train_data,
+            path=opts.validation_data,
             n_range=opts.n_range,
         ),
         batch_size=opts.validation_batch_size,
@@ -217,107 +185,82 @@ def main(params):
         num_workers=1,
     )
     print('Initialising game...')
-    if opts.max_len==0: #symbolic
-        
-        n_features = 2 * opts.n_range
-        # n_features = 2*int(np.log2(opts.n_range)+1)
-        # n_features_rec = int(np.log2(2*opts.n_range)+1)
-        if opts.loss == 'xent':
-            n_features_rec = n_features
-        elif opts.loss == 'mse':
-            n_features_rec = 1
-        
-        receiver = RecoReceiver(n_features=n_features_rec, n_hidden=opts.receiver_hidden)
-        sender = Sender(n_hidden=opts.vocab_size, n_features=n_features, log_sftmx=True)
+    # the number of features for the Receiver (input) is given by 2*n_range because
+    # they are fed concat 1-hot representations of the input vectors
+    # It is similar for the sender as max sum is N+N=2N
+    n_features = 2 * opts.n_range
+    if opts.loss == 'xent':
+        n_features_rec = n_features - 1
+    elif opts.loss == 'mse':
+        n_features_rec = 1
+    # we define here the core of the receiver for the discriminative game, see the architectures.py file for details
+    # this will be embedded in a wrapper below to define the full architecture
+    receiver = RecoReceiver(n_features=n_features_rec, n_hidden=opts.receiver_hidden)
 
-        if opts.mode.lower() == "gs":
-            sender = core.GumbelSoftmaxWrapper(sender, temperature=opts.temperature)
-            receiver = core.SymbolReceiverWrapper(receiver, vocab_size=opts.vocab_size, agent_input_size=opts.receiver_hidden)
-            game = core.SymbolGameGS(sender, receiver, loss)
-            callbacks = [core.TemperatureUpdater(agent=sender, decay=0.9, minimum=0.1)]
-        else:  # NB: any other string than gs will lead to rf training!
-            sender = core.ReinforceWrapper(sender)
-            receiver = core.ReinforceDeterministicWrapper(receiver)
-            receiver = core.SymbolReceiverWrapper(receiver, vocab_size=opts.vocab_size, agent_input_size=opts.receiver_hidden)
-            game = core.SymbolGameReinforce(sender, receiver, loss, sender_entropy_coeff=opts.sender_entropy_coeff, receiver_entropy_coeff=0.0)
-            callbacks = []
-    else:
-        # the number of features for the Receiver (input) is given by 2*n_range because
-        # they are fed concat 1-hot representations of the input vectors
-        # It is similar for the sender as max sum is N+N=2N
-        n_features = 2 * opts.n_range
-        if opts.loss == 'xent':
-            n_features_rec = n_features
-        elif opts.loss == 'mse':
-            n_features_rec = 1
-        # we define here the core of the receiver for the discriminative game, see the architectures.py file for details
-        # this will be embedded in a wrapper below to define the full architecture
-        receiver = RecoReceiver(n_features=n_features_rec, n_hidden=opts.receiver_hidden)
+    # we are now outside the block that defined game-type-specific aspects of the games: note that the core Sender architecture
+    # (see architectures.py for details) is shared by the two games (it maps an input vector to a hidden layer that will be use to initialize
+    # the message-producing RNN): this will also be embedded in a wrapper below to define the full architecture
+    
+    sender = Sender(n_hidden=opts.sender_hidden, n_features=n_features)
 
-        # we are now outside the block that defined game-type-specific aspects of the games: note that the core Sender architecture
-        # (see architectures.py for details) is shared by the two games (it maps an input vector to a hidden layer that will be use to initialize
-        # the message-producing RNN): this will also be embedded in a wrapper below to define the full architecture
+    # now, we instantiate the full sender and receiver architectures, and connect them and the loss into a game object
+    # the implementation differs slightly depending on whether communication is optimized via Gumbel-Softmax ('gs') or Reinforce ('rf', default)
+    if opts.mode.lower() == "gs":
+        # in the following lines, we embed the Sender and Receiver architectures into standard EGG wrappers that are appropriate for Gumbel-Softmax optimization
+        # the Sender wrapper takes the hidden layer produced by the core agent architecture we defined above when processing input, and uses it to initialize
+        # the RNN that generates the message
         
-        sender = Sender(n_hidden=opts.sender_hidden, n_features=n_features)
-
-        # now, we instantiate the full sender and receiver architectures, and connect them and the loss into a game object
-        # the implementation differs slightly depending on whether communication is optimized via Gumbel-Softmax ('gs') or Reinforce ('rf', default)
-        if opts.mode.lower() == "gs":
-            # in the following lines, we embed the Sender and Receiver architectures into standard EGG wrappers that are appropriate for Gumbel-Softmax optimization
-            # the Sender wrapper takes the hidden layer produced by the core agent architecture we defined above when processing input, and uses it to initialize
-            # the RNN that generates the message
-            
-            sender = core.RnnSenderGS(
-                sender,
-                vocab_size=opts.vocab_size,
-                embed_dim=opts.sender_embedding,
-                hidden_size=opts.sender_hidden,
-                cell=opts.sender_cell,
-                max_len=opts.max_len,
-                temperature=opts.temperature,
-            )
-            # the Receiver wrapper takes the symbol produced by the Sender at each step (more precisely, in Gumbel-Softmax mode, a function of the overall probability
-            # of non-eos symbols upt to the step is used), maps it to a hidden layer through a RNN, and feeds this hidden layer to the
-            # core Receiver architecture we defined above (possibly with other Receiver input, as determined by the core architecture) to generate the output
-            receiver = core.RnnReceiverGS(
-                receiver,
-                vocab_size=opts.vocab_size,
-                embed_dim=opts.receiver_embedding,
-                hidden_size=opts.receiver_hidden,
-                cell=opts.receiver_cell,
-            )
-            game = core.SenderReceiverRnnGS(sender, receiver, loss)
-            # callback functions can be passed to the trainer object (see below) to operate at certain steps of training and validation
-            # for example, the TemperatureUpdater (defined in callbacks.py in the core directory) will update the Gumbel-Softmax temperature hyperparameter
-            # after each epoch
-            callbacks = [core.TemperatureUpdater(agent=sender, decay=0.9, minimum=0.1)]
-        else:  # NB: any other string than gs will lead to rf training!
-            # here, the interesting thing to note is that we use the same core architectures we defined above, but now we embed them in wrappers that are suited to
-            # Reinforce-based optmization
-            # if opts.max_len>1:
-            sender = core.RnnSenderReinforce(
-                sender,
-                vocab_size=opts.vocab_size,
-                embed_dim=opts.sender_embedding,
-                hidden_size=opts.sender_hidden,
-                cell=opts.sender_cell,
-                max_len=opts.max_len,
-            )
-            receiver = core.RnnReceiverDeterministic(
-                receiver,
-                vocab_size=opts.vocab_size,
-                embed_dim=opts.receiver_embedding,
-                hidden_size=opts.receiver_hidden,
-                cell=opts.receiver_cell,
-            )
-            game = core.SenderReceiverRnnReinforce(
-                sender,
-                receiver,
-                loss,
-                sender_entropy_coeff=opts.sender_entropy_coeff,
-                receiver_entropy_coeff=0,
-            )
-            callbacks = []
+        sender = core.RnnSenderGS(
+            sender,
+            vocab_size=opts.vocab_size,
+            embed_dim=opts.sender_embedding,
+            hidden_size=opts.sender_hidden,
+            cell=opts.sender_cell,
+            max_len=opts.max_len,
+            temperature=opts.temperature,
+        )
+        # the Receiver wrapper takes the symbol produced by the Sender at each step (more precisely, in Gumbel-Softmax mode, a function of the overall probability
+        # of non-eos symbols upt to the step is used), maps it to a hidden layer through a RNN, and feeds this hidden layer to the
+        # core Receiver architecture we defined above (possibly with other Receiver input, as determined by the core architecture) to generate the output
+        receiver = core.RnnReceiverGS(
+            receiver,
+            vocab_size=opts.vocab_size,
+            embed_dim=opts.receiver_embedding,
+            hidden_size=opts.receiver_hidden,
+            cell=opts.receiver_cell,
+        )
+        game = core.SenderReceiverRnnGS(sender, receiver, loss)
+        # callback functions can be passed to the trainer object (see below) to operate at certain steps of training and validation
+        # for example, the TemperatureUpdater (defined in callbacks.py in the core directory) will update the Gumbel-Softmax temperature hyperparameter
+        # after each epoch
+        callbacks = [core.TemperatureUpdater(agent=sender, decay=0.9, minimum=0.1)]
+    else:  # NB: any other string than gs will lead to rf training!
+        # here, the interesting thing to note is that we use the same core architectures we defined above, but now we embed them in wrappers that are suited to
+        # Reinforce-based optmization
+        # if opts.max_len>1:
+        sender = core.RnnSenderReinforce(
+            sender,
+            vocab_size=opts.vocab_size,
+            embed_dim=opts.sender_embedding,
+            hidden_size=opts.sender_hidden,
+            cell=opts.sender_cell,
+            max_len=opts.max_len,
+        )
+        receiver = core.RnnReceiverDeterministic(
+            receiver,
+            vocab_size=opts.vocab_size,
+            embed_dim=opts.receiver_embedding,
+            hidden_size=opts.receiver_hidden,
+            cell=opts.receiver_cell,
+        )
+        game = core.SenderReceiverRnnReinforce(
+            sender,
+            receiver,
+            loss,
+            sender_entropy_coeff=opts.sender_entropy_coeff,
+            receiver_entropy_coeff=0,
+        )
+        callbacks = []
 
 
     # we are almost ready to train: we define here an optimizer calling standard pytorch functionality
@@ -354,19 +297,92 @@ def main(params):
     print('Start training!')
     trainer.train(n_epochs=opts.n_epochs)
 
-    # Visu
-    print('VISUALISATION')
-    game.eval()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    for z in range(opts.vocab_size):
-        t = torch.zeros(opts.vocab_size).to(device)
-        t[z] = 1
-        with torch.no_grad():
-            sample, _1, _2 = game.receiver(t, None, None)
-            sample = sample.float().cpu()
-        sample = sample.argmax(dim=-1).item()
-        print('msg[%d]->out[%d]'%(z, sample))
-    print('end')
+    if opts.analyse:
+
+        import pandas as pd
+        import seaborn as sns
+        import matplotlib
+        import matplotlib.pyplot as plt
+
+        # Customize matplotlib
+        matplotlib.rcParams.update(
+            {
+                'text.usetex': False,
+                'font.family': 'stixgeneral',
+                'mathtext.fontset': 'stix',
+            }
+        )
+
+        print('Start Evaluating')
+        mean_loss, full_interaction = trainer.eval()
+        acc = full_interaction.aux['acc'].mean()
+        dist = full_interaction.aux['dist'].mean()
+        print('Accuracy: %.2f'%(acc*100))
+        print('Distance: %.2f'%(dist))
+
+        
+        # Visualisation : (length=1 only)
+        if opts.max_len==1:
+            sender_input = full_interaction.sender_input
+            datalength = sender_input.size(0)
+            labels = full_interaction.labels
+            ar = torch.arange(opts.n_range).to(sender_input.device)
+            ar = torch.stack([ar]*sender_input.size(0), dim=0)
+            input_pairs = torch.stack(((ar*sender_input[:, :opts.n_range]).sum(-1), (ar*sender_input[:, opts.n_range:]).sum(-1)), dim=-1).long()
+            message = full_interaction.message[:,0].squeeze()
+            receiver_prediction = full_interaction.receiver_output.argmax(dim=-1)
+
+            m = torch.full((opts.n_range, opts.n_range), -1)
+            s = torch.full((opts.n_range, opts.n_range), -1)
+            msg2out = {}
+            input2msg = {}
+            output2msg = {}
+            for i, p in enumerate(input_pairs):
+                m[p[0], p[1]]=message[i]
+                s[p[0], p[1]]=receiver_prediction[i]
+                if message[i].item() not in msg2out:
+                    msg2out[message[i].item()] = receiver_prediction[i].item()
+                input_pair = (p[0].item(), p[1].item())
+                if input_pair not in input2msg:
+                    input2msg[input_pair] = message[i].item()
+                output = receiver_prediction[i].item()
+                if output not in output2msg:
+                    output2msg[output] = message[i].item()
+
+            
+            # # Plot the communication
+            fig = plt.figure()
+            cmap = sns.color_palette("hsv", opts.vocab_size)
+            if -1 in m:
+                cmap[0] = (1., 1., 1., 1)
+            # newcmp = ListedColormap(newcolors)
+            # cmap = (0., 0., 0.) + list(cmap)
+            ax = sns.heatmap(m, cmap=cmap, annot=False)
+            # We change the fontsize of minor ticks label 
+            ax.tick_params(axis='both', which='major', labelsize=8)
+            ax.tick_params(axis='both', which='minor', labelsize=6)
+            plt.savefig('analyse_message.pdf', dpi=800)
+            # Plot prediction
+            fig = plt.figure()
+            ax = sns.heatmap(s, annot=False)
+            # We change the fontsize of minor ticks label 
+            ax.tick_params(axis='both', which='major', labelsize=8)
+            ax.tick_params(axis='both', which='minor', labelsize=6)
+            plt.savefig('analyse_pred.pdf', dpi=800)
+
+            # How many symbols are used?
+            used_symbols, counts_in = np.unique(list(input2msg.values()), return_counts=True)
+            print('%d/%d symbols are used!'%(len(used_symbols), opts.vocab_size))
+            # Is there any synonymy? (multiple symbols referring to the same input or output)
+            out_val, counts_out = np.unique(list(msg2out.values()), return_counts=True)
+            cpt_syn_out = sum([c>1 for c in counts_out])
+            # uncomment to print the synonyms
+            # print(''.join(['%d symbols -> %d\n'%(c, out_val[idx]) for idx, c in enumerate(counts_out) if c>1]))
+            print('There is %d groups of synonyms (1 output is reffered by multiple different symbols)'%cpt_syn_out)
+            # Is there any polysemy? (different inputs/outputs denoted by the same symbol)
+            cpt_pol_in = sum([c>1 for c in counts_in])
+            print('There is %d polysems (1 symbol refers to multiple different input'%cpt_pol_in)
+            # agents are deterministics, then no synonyms relative to outputs and no polysems relative to input
 
 if __name__ == "__main__":
     import sys
