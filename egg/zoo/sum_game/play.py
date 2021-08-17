@@ -12,8 +12,8 @@ from torch.utils.data import DataLoader
 
 import egg.core as core
 from egg.core import Callback, Interaction, PrintValidationEvents
-from egg.zoo.sum_game.architectures import DiscriReceiver, RecoReceiver, Sender, SenderOracle
-from egg.zoo.sum_game.data_readers import SumDataset, BinarySumDataset
+from egg.zoo.sum_game.architectures import RecoReceiver, Sender, SenderOracle
+from egg.zoo.sum_game.data_readers import SumDataset
 
 
 # the following section specifies parameters that are specific to our games: we will also inherit the
